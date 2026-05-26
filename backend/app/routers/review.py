@@ -10,6 +10,7 @@ Provides three endpoints:
 import json
 import uuid
 import logging
+import asyncio
 from datetime import datetime
 from typing import AsyncGenerator
 
@@ -17,15 +18,13 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.models.review import ReviewRequest, ReviewResponse, ReviewStatus
+from app.agents.pr_agent import run_review
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["review"])
 
 # In-memory job storage (MVP; Phase 7 can add database)
 reviews_store: dict[str, ReviewResponse] = {}
-
-# Placeholder for Phase 3 agent (will be imported once Phase 3 is complete)
-# from app.agents.pr_agent import run_review
 
 
 @router.post("/review", response_model=ReviewResponse)
@@ -60,28 +59,27 @@ async def create_review(request: ReviewRequest) -> ReviewResponse:
             completed_at=None,
         )
 
-        # Store in-memory
+        # Store in-memory with PENDING status initially
         reviews_store[review_id] = response
-
         logger.info(
             f"Review job created: {review_id} for PR: {request.pr_url[:60]}..."
         )
 
-        # Phase 3: Call agent here
-        # try:
-        #     summary = await run_review(request)
-        #     response.result = summary
-        #     response.status = ReviewStatus.COMPLETED
-        #     response.completed_at = datetime.utcnow()
-        #     logger.info(f"Review completed: {review_id}, score={summary.overall_score}")
-        # except Exception as e:
-        #     logger.exception(f"Agent error for review {review_id}: {e}")
-        #     response.status = ReviewStatus.FAILED
-        #     response.completed_at = datetime.utcnow()
-        #     reviews_store[review_id] = response
-        #     raise HTTPException(status_code=500, detail=f"Review failed: {str(e)}")
+        # Call Phase 3 agent to run the review
+        try:
+            summary = await run_review(request)
+            response.result = summary
+            response.status = ReviewStatus.COMPLETED
+            response.completed_at = datetime.utcnow()
+            logger.info(f"Review completed: {review_id}, score={summary.overall_score}")
+        except Exception as e:
+            logger.exception(f"Agent error for review {review_id}: {e}")
+            response.status = ReviewStatus.FAILED
+            response.completed_at = datetime.utcnow()
+            reviews_store[review_id] = response
+            raise HTTPException(status_code=500, detail=f"Review failed: {str(e)}")
 
-        # For now: return PENDING status (Phase 3 will implement actual review)
+        # Update storage with final response
         reviews_store[review_id] = response
         return response
 
@@ -154,46 +152,30 @@ async def stream_review(request: ReviewRequest):
             # Emit initial status
             yield f"data: \"Fetching PR metadata...\"\n\n"
 
-            # Phase 3: Call agent with progress callback
-            # For MVP: emit hardcoded progress messages
-            progress_steps = [
-                (0.1, "Fetching PR metadata..."),
-                (0.3, "Fetching changed files..."),
-                (0.5, "Analyzing code changes..."),
-                (0.7, "Running Claude review..."),
-                (0.9, "Formatting results..."),
-            ]
+            # Queue to collect progress messages from agent
+            progress_messages = []
 
-            # Emit progress messages
-            for delay, message in progress_steps:
-                yield f"data: {json.dumps(message)}\n\n"
-                # In real implementation: await asyncio.sleep(delay)
-                # For now: just emit messages
+            async def progress_callback(message: str) -> None:
+                """Called by agent nodes to report progress."""
+                progress_messages.append(message)
 
-            # Phase 3: Call agent here
-            # try:
-            #     summary = await run_review(request)
-            #     result_json = summary.model_dump_json()
-            #     yield f"event: complete\ndata: {result_json}\n\n"
-            #     logger.info(f"SSE stream completed: PR review finished")
-            # except Exception as e:
-            #     logger.exception(f"Agent error in stream_review: {e}")
-            #     error_response = {"error": str(e), "type": type(e).__name__}
-            #     yield f"event: error\ndata: {json.dumps(error_response)}\n\n"
+            # Call Phase 3 agent with progress callback
+            try:
+                summary = await run_review(request, progress_callback=progress_callback)
 
-            # For now: emit a mock complete message (Phase 3 will implement real review)
-            mock_summary = {
-                "pr_title": "Mock Review (Phase 3 pending)",
-                "overall_score": 0,
-                "verdict": "pending",
-                "pr_url": request.pr_url,
-                "comments": [],
-                "strengths": ["Waiting for Phase 3 agent implementation"],
-                "critical_issues": [],
-                "summary": "This is a mock response. Phase 3 agent will implement real PR review.",
-            }
-            yield f"event: complete\ndata: {json.dumps(mock_summary)}\n\n"
-            logger.info("SSE stream completed (mock response)")
+                # Emit collected progress messages
+                for msg in progress_messages:
+                    yield f"data: {json.dumps(msg)}\n\n"
+
+                # Emit final result
+                result_json = summary.model_dump_json()
+                yield f"event: complete\ndata: {result_json}\n\n"
+                logger.info(f"SSE stream completed: PR review finished")
+
+            except Exception as e:
+                logger.exception(f"Agent error in stream_review: {e}")
+                error_response = {"error": str(e), "type": type(e).__name__}
+                yield f"event: error\ndata: {json.dumps(error_response)}\n\n"
 
         except Exception as e:
             logger.exception(f"Unexpected error in event_generator: {e}")
