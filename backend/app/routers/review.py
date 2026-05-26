@@ -139,7 +139,7 @@ async def stream_review(request: ReviewRequest):
     Example SSE output:
         data: "Fetching PR metadata..."
         data: "Analyzing diffs..."
-        data: "Running Claude review..."
+        data: "Running Openai review..."
         event: complete
         data: {"pr_title": "...", "overall_score": 82, ...full ReviewSummary...}
     """

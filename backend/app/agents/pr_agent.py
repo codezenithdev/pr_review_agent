@@ -3,7 +3,7 @@ LangGraph agent for PR review orchestration.
 
 Orchestrates the complete review workflow:
 1. Fetch PR metadata, files, and commits from GitHub
-2. Invoke Claude API for intelligent code review analysis
+2. Invoke OpenAI API for intelligent code review analysis
 3. Parse response into structured ReviewSummary
 4. Handle progress callbacks for real-time streaming
 """
@@ -40,13 +40,13 @@ class AgentState(TypedDict):
     pr_metadata_result: Optional[dict]
     pr_files_result: Optional[dict]
     pr_commits_result: Optional[dict]
-    claude_response: Optional[str]
+    openai_response: Optional[str]
     review_summary: Optional[ReviewSummary]
     error: Optional[str]
     progress_callback: Optional[Callable[[str], Awaitable[None]]]
 
 
-# System prompt for Claude - defines review dimensions and output format
+# System prompt for OpenAI - defines review dimensions and output format
 REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer. Analyze the provided GitHub PR and provide a comprehensive review.
 
 Your review should evaluate:
@@ -158,15 +158,15 @@ async def node_fetch_pr_commits(state: AgentState) -> AgentState:
         return state
 
 
-async def node_analyze_with_claude(state: AgentState) -> AgentState:
-    """Invoke Claude API to analyze the PR."""
+async def node_analyze_with_openai(state: AgentState) -> AgentState:
+    """Invoke openai API to analyze the PR."""
     try:
         if state.get("progress_callback"):
-            await state["progress_callback"]("Analyzing with Claude...")
+            await state["progress_callback"]("Analyzing with openai...")
 
         # Check for errors from previous nodes
         if state.get("error"):
-            logger.error(f"Skipping Claude analysis due to error: {state['error']}")
+            logger.error(f"Skipping openai analysis due to error: {state['error']}")
             return state
 
         # Build metadata from gathered GitHub data
@@ -175,17 +175,17 @@ async def node_analyze_with_claude(state: AgentState) -> AgentState:
         metadata = ReviewMetadata(**metadata_dict)
         state["metadata"] = metadata
 
-        # Build the prompt for Claude with all gathered information
+        # Build the prompt for openai with all gathered information
         user_prompt = _build_analysis_prompt(
             metadata, state["pr_commits_result"], state["request"]
         )
 
-        logger.info(f"Invoking Claude for PR analysis")
+        logger.info(f"Invoking Openai for PR analysis")
 
-        # Initialize Claude via LangChain
-        llm = ChatOpenAI(model="claude-3-5-sonnet-20241022", temperature=0.7)
+        # Initialize GPT-4 via LangChain (using OpenAI API key)
+        llm = ChatOpenAI(model="gpt-4-turbo", temperature=0.7)
 
-        # Call Claude API
+        # Call openai API
         message = await llm.ainvoke(
             [
                 SystemMessage(content=REVIEW_SYSTEM_PROMPT),
@@ -194,37 +194,37 @@ async def node_analyze_with_claude(state: AgentState) -> AgentState:
         )
 
         response_text = message.content
-        logger.info(f"Claude response received: {len(response_text)} chars")
+        logger.info(f"openai response received: {len(response_text)} chars")
 
-        state["claude_response"] = response_text
+        state["openai_response"] = response_text
         return state
 
     except Exception as e:
-        state["error"] = f"Error invoking Claude: {str(e)}"
+        state["error"] = f"Error invoking openai: {str(e)}"
         logger.exception(state["error"])
         return state
 
 
 async def node_parse_response(state: AgentState) -> AgentState:
-    """Parse Claude's JSON response into ReviewSummary."""
+    """Parse openai's JSON response into ReviewSummary."""
     try:
         if state.get("error"):
             logger.error(f"Skipping parsing due to error: {state['error']}")
             return state
 
-        if not state.get("claude_response"):
-            state["error"] = "No Claude response to parse"
+        if not state.get("openai_response"):
+            state["error"] = "No openai response to parse"
             logger.error(state["error"])
             return state
 
-        logger.info("Parsing Claude response into ReviewSummary")
+        logger.info("Parsing openai response into ReviewSummary")
 
-        # Extract JSON from Claude response
-        response_text = state["claude_response"]
+        # Extract JSON from openai response
+        response_text = state["openai_response"]
 
         # Try to extract JSON from the response
         try:
-            # First, try direct JSON parsing (Claude should return pure JSON)
+            # First, try direct JSON parsing (openai should return pure JSON)
             parsed = json.loads(response_text)
         except json.JSONDecodeError:
             # If that fails, try to extract JSON from markdown code blocks
@@ -264,7 +264,7 @@ async def node_parse_response(state: AgentState) -> AgentState:
         return state
 
     except Exception as e:
-        state["error"] = f"Error parsing Claude response: {str(e)}"
+        state["error"] = f"Error parsing openai response: {str(e)}"
         logger.exception(state["error"])
         return state
 
@@ -272,7 +272,7 @@ async def node_parse_response(state: AgentState) -> AgentState:
 def _build_analysis_prompt(
     metadata: ReviewMetadata, commits_result: dict, request: ReviewRequest
 ) -> str:
-    """Build the user prompt for Claude with PR details."""
+    """Build the user prompt for openai with PR details."""
     prompt_parts = [
         f"# PR Review Request",
         f"\n## PR Information",
@@ -325,15 +325,15 @@ def _build_review_graph():
     graph.add_node("fetch_metadata", node_fetch_pr_metadata)
     graph.add_node("fetch_files", node_fetch_pr_files)
     graph.add_node("fetch_commits", node_fetch_pr_commits)
-    graph.add_node("analyze_claude", node_analyze_with_claude)
+    graph.add_node("analyze_openai", node_analyze_with_openai)
     graph.add_node("parse_response", node_parse_response)
 
     # Define edges (workflow)
     graph.set_entry_point("fetch_metadata")
     graph.add_edge("fetch_metadata", "fetch_files")
     graph.add_edge("fetch_files", "fetch_commits")
-    graph.add_edge("fetch_commits", "analyze_claude")
-    graph.add_edge("analyze_claude", "parse_response")
+    graph.add_edge("fetch_commits", "analyze_openai")
+    graph.add_edge("analyze_openai", "parse_response")
     graph.add_edge("parse_response", END)
 
     return graph.compile()
@@ -380,7 +380,7 @@ async def run_review(
             "pr_metadata_result": None,
             "pr_files_result": None,
             "pr_commits_result": None,
-            "claude_response": None,
+            "openai_response": None,
             "review_summary": None,
             "error": None,
             "progress_callback": progress_callback,

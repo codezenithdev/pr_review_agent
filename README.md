@@ -1,6 +1,6 @@
 # PR Review Agent
 
-A full-stack application that leverages LangGraph and LangChain to provide automated PR reviews using Claude API.
+A full-stack application that leverages LangGraph and LangChain to provide automated PR reviews using OpenAI API.
 
 ## Project Structure
 
@@ -91,7 +91,7 @@ Create a `backend/.env` file based on `backend/.env.example`:
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `OPENAI_API_KEY` | OpenAI API key for Claude access | Yes |
+| `OPENAI_API_KEY` | OpenAI API key for Open AI access | Yes |
 | `GITHUB_TOKEN` | GitHub token for PR access | Yes |
 | `LANGCHAIN_TRACING_V2` | Enable LangChain tracing | No (set `true` to debug) |
 | `LANGCHAIN_API_KEY` | LangChain API key for tracing | No |
