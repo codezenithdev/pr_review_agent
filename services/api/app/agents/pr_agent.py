@@ -3,19 +3,21 @@ LangGraph agent for PR review orchestration.
 
 Orchestrates the complete review workflow:
 1. Fetch PR metadata, files, and commits from GitHub
-2. Invoke OpenAI API for intelligent code review analysis
+2. Invoke OpenAI API (GPT-4) for intelligent code review analysis
 3. Parse response into structured ReviewSummary
 4. Handle progress callbacks for real-time streaming
 """
 
 import json
 import logging
+import os
 from typing import TypedDict, Optional, Callable, Awaitable
 from datetime import datetime
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
+from langsmith import traceable
 
 from app.models.review import (
     ReviewRequest,
@@ -30,6 +32,48 @@ from app.tools.github import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Demo mode flag (set DEMO_MODE=true to run without API keys)
+DEMO_MODE = os.getenv("DEMO_MODE", "false").lower() == "true"
+
+
+def get_demo_review(pr_url: str) -> ReviewSummary:
+    """Return mock review data for testing without API keys."""
+    return ReviewSummary(
+        pr_title="Demo PR: Add feature X",
+        pr_url=pr_url,
+        overall_score=82,
+        verdict="approve_with_suggestions",
+        strengths=[
+            "Well-organized code structure",
+            "Good use of type hints",
+            "Clear and descriptive variable names"
+        ],
+        critical_issues=[
+            "Input validation missing on user-submitted data",
+            "No rate limiting on API endpoint"
+        ],
+        comments=[
+            ReviewComment(
+                file="src/main.py",
+                line=42,
+                severity="warning",
+                category="security",
+                title="Input validation",
+                body="User input should be validated before processing to prevent injection attacks"
+            ),
+            ReviewComment(
+                file="src/utils.py",
+                line=158,
+                severity="info",
+                category="style",
+                title="Code style",
+                body="Consider using f-strings instead of .format() for consistency"
+            )
+        ],
+        summary="Well-written code with minor security and performance considerations. Good overall structure.",
+        pr_author="demo-user"
+    )
 
 
 class AgentState(TypedDict):
@@ -46,7 +90,7 @@ class AgentState(TypedDict):
     progress_callback: Optional[Callable[[str], Awaitable[None]]]
 
 
-# System prompt for OpenAI - defines review dimensions and output format
+# System prompt for GPT-4 - defines review dimensions and output format
 REVIEW_SYSTEM_PROMPT = """You are an expert code reviewer. Analyze the provided GitHub PR and provide a comprehensive review.
 
 Your review should evaluate:
@@ -94,7 +138,15 @@ async def node_fetch_pr_metadata(state: AgentState) -> AgentState:
         result = fetch_pr_metadata.invoke({"pr_url": state["request"].pr_url})
 
         if "error" in result:
-            state["error"] = f"Failed to fetch PR metadata: {result['error']}"
+            error_msg = result['error'].lower()
+            if "not found" in error_msg or "404" in error_msg:
+                state["error"] = "❌ PR not found. Check URL is correct and PR is public or you have access."
+            elif "unauthorized" in error_msg or "401" in error_msg or "authentication" in error_msg:
+                state["error"] = "❌ GitHub authentication failed. Check GITHUB_TOKEN in .env file."
+            elif "rate limit" in error_msg or "429" in error_msg:
+                state["error"] = "❌ GitHub API rate limited. Try again in an hour."
+            else:
+                state["error"] = f"❌ Failed to fetch PR: {result['error']}"
             logger.error(state["error"])
             return state
 
@@ -103,7 +155,7 @@ async def node_fetch_pr_metadata(state: AgentState) -> AgentState:
         return state
 
     except Exception as e:
-        state["error"] = f"Error fetching PR metadata: {str(e)}"
+        state["error"] = f"❌ Error fetching PR metadata: {str(e)[:100]}"
         logger.exception(state["error"])
         return state
 
@@ -159,14 +211,14 @@ async def node_fetch_pr_commits(state: AgentState) -> AgentState:
 
 
 async def node_analyze_with_openai(state: AgentState) -> AgentState:
-    """Invoke openai API to analyze the PR."""
+    """Invoke OpenAI API (GPT-4) to analyze the PR."""
     try:
         if state.get("progress_callback"):
-            await state["progress_callback"]("Analyzing with openai...")
+            await state["progress_callback"]("Analyzing with GPT-4...")
 
         # Check for errors from previous nodes
         if state.get("error"):
-            logger.error(f"Skipping openai analysis due to error: {state['error']}")
+            logger.error(f"Skipping OpenAI analysis due to error: {state['error']}")
             return state
 
         # Build metadata from gathered GitHub data
@@ -175,17 +227,17 @@ async def node_analyze_with_openai(state: AgentState) -> AgentState:
         metadata = ReviewMetadata(**metadata_dict)
         state["metadata"] = metadata
 
-        # Build the prompt for openai with all gathered information
+        # Build the prompt for OpenAI with all gathered information
         user_prompt = _build_analysis_prompt(
             metadata, state["pr_commits_result"], state["request"]
         )
 
-        logger.info(f"Invoking Openai for PR analysis")
+        logger.info(f"Invoking OpenAI GPT-4 for PR analysis")
 
-        # Initialize GPT-4 via LangChain (using OpenAI API key)
+        # Initialize OpenAI via LangChain
         llm = ChatOpenAI(model="gpt-4-turbo", temperature=0.7)
 
-        # Call openai API
+        # Call OpenAI API
         message = await llm.ainvoke(
             [
                 SystemMessage(content=REVIEW_SYSTEM_PROMPT),
@@ -194,37 +246,48 @@ async def node_analyze_with_openai(state: AgentState) -> AgentState:
         )
 
         response_text = message.content
-        logger.info(f"openai response received: {len(response_text)} chars")
+        logger.info(f"OpenAI response received: {len(response_text)} chars")
 
         state["openai_response"] = response_text
         return state
 
     except Exception as e:
-        state["error"] = f"Error invoking openai: {str(e)}"
-        logger.exception(state["error"])
+        error_str = str(e).lower()
+        if "authentication" in error_str or "unauthorized" in error_str or "401" in error_str:
+            state["error"] = "❌ OpenAI API authentication failed. Check OPENAI_API_KEY in .env file."
+        elif "rate limit" in error_str or "429" in error_str:
+            state["error"] = "❌ OpenAI API rate limited. Try again in a few minutes."
+        elif "timeout" in error_str or "timed out" in error_str:
+            state["error"] = "❌ OpenAI API request timed out. Try again with a simpler PR."
+        elif "connection" in error_str:
+            state["error"] = "❌ Could not connect to OpenAI API. Check internet connection."
+        else:
+            state["error"] = f"❌ OpenAI API error: {str(e)[:100]}"
+
+        logger.exception(f"OpenAI API error: {e}")
         return state
 
 
 async def node_parse_response(state: AgentState) -> AgentState:
-    """Parse openai's JSON response into ReviewSummary."""
+    """Parse OpenAI's JSON response into ReviewSummary."""
     try:
         if state.get("error"):
             logger.error(f"Skipping parsing due to error: {state['error']}")
             return state
 
         if not state.get("openai_response"):
-            state["error"] = "No openai response to parse"
+            state["error"] = "No OpenAI response to parse"
             logger.error(state["error"])
             return state
 
-        logger.info("Parsing openai response into ReviewSummary")
+        logger.info("Parsing OpenAI response into ReviewSummary")
 
-        # Extract JSON from openai response
+        # Extract JSON from OpenAI response
         response_text = state["openai_response"]
 
         # Try to extract JSON from the response
         try:
-            # First, try direct JSON parsing (openai should return pure JSON)
+            # First, try direct JSON parsing (OpenAI should return pure JSON)
             parsed = json.loads(response_text)
         except json.JSONDecodeError:
             # If that fails, try to extract JSON from markdown code blocks
@@ -264,7 +327,7 @@ async def node_parse_response(state: AgentState) -> AgentState:
         return state
 
     except Exception as e:
-        state["error"] = f"Error parsing openai response: {str(e)}"
+        state["error"] = f"Error parsing OpenAI response: {str(e)}"
         logger.exception(state["error"])
         return state
 
@@ -351,6 +414,7 @@ def _get_review_graph():
     return _review_graph
 
 
+@traceable(name="run_review", run_type="llm")
 async def run_review(
     request: ReviewRequest,
     progress_callback: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -358,7 +422,7 @@ async def run_review(
     """
     Main async function to run a complete PR review.
 
-    This is the entry point called by Phase 4 endpoints.
+    Uses OpenAI's GPT-4 API via LangChain for intelligent code analysis.
 
     Args:
         request: ReviewRequest with pr_url and optional focus_areas/custom_prompt
@@ -372,6 +436,14 @@ async def run_review(
     """
     try:
         logger.info(f"Starting review for PR: {request.pr_url}")
+
+        # Check if demo mode is enabled
+        if DEMO_MODE:
+            if progress_callback:
+                await progress_callback("🎭 Running in demo mode (no API keys required)")
+                await progress_callback("Generating mock review...")
+            logger.info("Demo mode enabled - returning mock review")
+            return get_demo_review(request.pr_url)
 
         # Initialize agent state
         initial_state: AgentState = {

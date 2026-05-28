@@ -55,7 +55,7 @@ Backend (FastAPI)
     ↓
 LangGraph Agent
     ↓
-Claude API + GitHub API
+OpenAI API (GPT-4) + GitHub API
 ```
 
 ## Configuration

@@ -68,6 +68,8 @@ if "current_pr_url" not in st.session_state:
     st.session_state.current_pr_url = ""
 if "current_review" not in st.session_state:
     st.session_state.current_review = None
+if "current_review_id" not in st.session_state:
+    st.session_state.current_review_id = None
 if "backend_available" not in st.session_state:
     st.session_state.backend_available = True
 
@@ -110,6 +112,18 @@ def stream_review(pr_url, focus_areas, custom_prompt):
             "focus_areas": focus_areas if focus_areas else None,
             "custom_prompt": custom_prompt if custom_prompt else None
         }
+
+        # First, submit review to get the review_id
+        try:
+            init_response = requests.post(REVIEW_ENDPOINT, json=payload, timeout=5)
+            if init_response.status_code == 200:
+                review_response = init_response.json()
+                review_id = review_response.get("id")
+                st.session_state.current_review_id = review_id
+            else:
+                st.warning("Could not get review ID for feedback (non-critical)")
+        except Exception as e:
+            st.warning(f"Could not initialize review for feedback: {e} (non-critical)")
 
         progress_placeholder = st.empty()
         status_placeholder = st.empty()
@@ -179,6 +193,32 @@ def stream_review(pr_url, focus_areas, custom_prompt):
     except Exception as e:
         st.error(f"❌ Error: {str(e)}")
         return None
+
+
+def submit_feedback(review_id: str, helpful: bool, comment: str = None):
+    """Submit feedback on a review to LangSmith for model improvement"""
+    try:
+        feedback_payload = {
+            "helpful": helpful,
+            "comment": comment if comment else None
+        }
+
+        response = requests.post(
+            f"{BACKEND_URL}/api/review/{review_id}/feedback",
+            json=feedback_payload,
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            st.success("✅ Feedback recorded! Thank you for helping improve the model.")
+            return True
+        else:
+            st.error(f"Failed to record feedback: {response.text}")
+            return False
+    except Exception as e:
+        st.error(f"Error sending feedback: {str(e)}")
+        return False
+
 
 def display_review_results(review):
     """Display formatted review results"""
@@ -287,16 +327,65 @@ def display_review_results(review):
         if st.button("🔄 Start New Review"):
             st.session_state.current_pr_url = ""
             st.session_state.current_review = None
+            st.session_state.current_review_id = None
             st.rerun()
 
     with col3:
         st.metric("Review Date", datetime.now().strftime("%Y-%m-%d %H:%M"))
 
+    # Feedback section (Phase 6)
+    st.markdown("---")
+    st.subheader("💬 Was this review helpful?")
+
+    feedback_cols = st.columns(2)
+
+    with feedback_cols[0]:
+        if st.button("👍 Helpful Review", use_container_width=True, key="helpful_btn"):
+            if st.session_state.current_review_id:
+                if submit_feedback(st.session_state.current_review_id, helpful=True):
+                    st.rerun()
+            else:
+                st.info("Review ID not available for feedback submission")
+
+    with feedback_cols[1]:
+        if st.button("👎 Not Helpful", use_container_width=True, key="not_helpful_btn"):
+            if st.session_state.current_review_id:
+                if submit_feedback(st.session_state.current_review_id, helpful=False):
+                    st.rerun()
+            else:
+                st.info("Review ID not available for feedback submission")
+
+    # Optional detailed feedback
+    with st.expander("📝 Add detailed feedback (optional)"):
+        feedback_comment = st.text_area(
+            "Your feedback helps improve the model:",
+            height=100,
+            placeholder="Tell us what you thought about this review...",
+            key="feedback_comment"
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Submit with Helpful feedback", use_container_width=True):
+                if st.session_state.current_review_id and feedback_comment:
+                    if submit_feedback(st.session_state.current_review_id, helpful=True, comment=feedback_comment):
+                        st.rerun()
+                elif not st.session_state.current_review_id:
+                    st.error("Review ID not available")
+
+        with col2:
+            if st.button("Submit with Negative feedback", use_container_width=True):
+                if st.session_state.current_review_id and feedback_comment:
+                    if submit_feedback(st.session_state.current_review_id, helpful=False, comment=feedback_comment):
+                        st.rerun()
+                elif not st.session_state.current_review_id:
+                    st.error("Review ID not available")
+
 # Main UI
 st.markdown("""
 # 🔍 PR Review Agent
 
-Automated code review powered by Claude, LangGraph, and GitHub
+Automated code review powered by OpenAI, LangGraph, and GitHub
 """)
 
 # Sidebar
@@ -402,7 +491,7 @@ if st.session_state.reviews and len(st.session_state.reviews) > 1:
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; padding: 20px; color: #666;">
-<p>🚀 <strong>PR Review Agent</strong> | Powered by Claude + LangGraph + FastAPI + Streamlit</p>
+<p>🚀 <strong>PR Review Agent</strong> | Powered by OpenAI + LangGraph + FastAPI + Streamlit</p>
 <p style="font-size: 12px;">Backend: http://localhost:8000 | Frontend: http://localhost:8501</p>
 </div>
 """, unsafe_allow_html=True)

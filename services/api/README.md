@@ -1,6 +1,6 @@
 # PR Review Agent - API Service
 
-FastAPI backend for automated GitHub PR code reviews powered by Claude and LangGraph.
+FastAPI backend for automated GitHub PR code reviews powered by OpenAI GPT-4 and LangGraph.
 
 ## Quick Start
 
@@ -16,7 +16,7 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # Edit .env with your API keys:
-# - OPENAI_API_KEY (for Claude)
+# - OPENAI_API_KEY (for OpenAI GPT-4)
 # - GITHUB_TOKEN (for GitHub API)
 ```
 
@@ -54,7 +54,7 @@ app/
 ## Environment Variables
 
 **Required:**
-- `OPENAI_API_KEY` — Claude API key
+- `OPENAI_API_KEY` — OpenAI API key (from https://platform.openai.com/api-keys)
 - `GITHUB_TOKEN` — GitHub personal access token
 
 **Optional (LangSmith):**

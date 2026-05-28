@@ -12,19 +12,24 @@ import uuid
 import logging
 import asyncio
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.models.review import ReviewRequest, ReviewResponse, ReviewStatus
 from app.agents.pr_agent import run_review
+from app.db import SessionLocal, ReviewRecord
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["review"])
 
-# In-memory job storage (MVP; Phase 7 can add database)
-reviews_store: dict[str, ReviewResponse] = {}
+
+class ReviewFeedback(BaseModel):
+    """User feedback on a completed review for LangSmith model improvement."""
+    helpful: bool
+    comment: Optional[str] = None
 
 
 @router.post("/review", response_model=ReviewResponse)
@@ -33,61 +38,70 @@ async def create_review(request: ReviewRequest) -> ReviewResponse:
     Submit a GitHub PR for code review.
 
     Accepts a PR URL and optional focus areas/custom prompt.
-    Returns immediately with a job ID and PENDING status.
-
-    For MVP: blocks until review completes.
-    Future: could use background tasks/job queue.
+    Returns immediately with a job ID and status (blocks until review completes).
 
     Args:
         request: ReviewRequest with pr_url (required) and optional focus_areas, custom_prompt
 
     Returns:
-        ReviewResponse with UUID, status (PENDING or COMPLETED), created_at, completed_at
+        ReviewResponse with UUID, status, created_at, completed_at
 
     Raises:
-        422: If ReviewRequest fails Pydantic validation (invalid PR URL, etc.)
+        422: If ReviewRequest fails Pydantic validation
         500: If unexpected error occurs during review
     """
+    db = SessionLocal()
     try:
-        # Create response object with UUID
         review_id = str(uuid.uuid4())
-        response = ReviewResponse(
+        created_at = datetime.utcnow()
+
+        # Create database record with PENDING status
+        db_record = ReviewRecord(
             id=review_id,
-            status=ReviewStatus.PENDING,
-            result=None,
-            created_at=datetime.utcnow(),
-            completed_at=None,
+            pr_url=request.pr_url,
+            status="in_progress",
+            created_at=created_at,
         )
+        db.add(db_record)
+        db.commit()
+        logger.info(f"Review job created: {review_id} for PR: {request.pr_url[:60]}...")
 
-        # Store in-memory with PENDING status initially
-        reviews_store[review_id] = response
-        logger.info(
-            f"Review job created: {review_id} for PR: {request.pr_url[:60]}..."
-        )
-
-        # Call Phase 3 agent to run the review
+        # Call agent to run the review
         try:
             summary = await run_review(request)
-            response.result = summary
-            response.status = ReviewStatus.COMPLETED
-            response.completed_at = datetime.utcnow()
+
+            # Update database record with results
+            db_record.status = "completed"
+            db_record.result = summary.model_dump_json()
+            db_record.completed_at = datetime.utcnow()
+            db_record.pr_title = summary.pr_title
+            db.commit()
+
             logger.info(f"Review completed: {review_id}, score={summary.overall_score}")
+
+            return ReviewResponse(
+                id=review_id,
+                status=ReviewStatus.COMPLETED,
+                result=summary,
+                created_at=created_at,
+                completed_at=db_record.completed_at,
+            )
+
         except Exception as e:
             logger.exception(f"Agent error for review {review_id}: {e}")
-            response.status = ReviewStatus.FAILED
-            response.completed_at = datetime.utcnow()
-            reviews_store[review_id] = response
+            db_record.status = "failed"
+            db_record.error = str(e)
+            db_record.completed_at = datetime.utcnow()
+            db.commit()
             raise HTTPException(status_code=500, detail=f"Review failed: {str(e)}")
-
-        # Update storage with final response
-        reviews_store[review_id] = response
-        return response
 
     except HTTPException:
         raise
     except Exception as e:
         logger.exception(f"Unexpected error in create_review: {e}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    finally:
+        db.close()
 
 
 @router.get("/review/{review_id}", response_model=ReviewResponse)
@@ -95,26 +109,40 @@ async def get_review(review_id: str) -> ReviewResponse:
     """
     Retrieve review status and results by ID.
 
-    Polls for the current status of a submitted review.
-    If status is COMPLETED, includes the ReviewSummary result.
-    If status is FAILED, review encountered an error.
-
     Args:
-        review_id: UUID of the review job (returned by POST /api/review)
+        review_id: UUID of the review job
 
     Returns:
-        ReviewResponse with current status, result (if completed), and timestamps
+        ReviewResponse with status, result, and timestamps
 
     Raises:
-        404: If review ID not found in storage
+        404: If review ID not found
     """
-    if review_id not in reviews_store:
-        logger.warning(f"Review not found: {review_id}")
-        raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+    db = SessionLocal()
+    try:
+        record = db.query(ReviewRecord).filter(ReviewRecord.id == review_id).first()
+        if not record:
+            logger.warning(f"Review not found: {review_id}")
+            raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
 
-    response = reviews_store[review_id]
-    logger.debug(f"Review status queried: {review_id}, status={response.status}")
-    return response
+        result = None
+        if record.result:
+            import json
+            result_dict = json.loads(record.result)
+            from app.models.review import ReviewSummary
+            result = ReviewSummary(**result_dict)
+
+        logger.debug(f"Review status queried: {review_id}, status={record.status}")
+
+        return ReviewResponse(
+            id=record.id,
+            status=ReviewStatus(record.status),
+            result=result,
+            created_at=record.created_at,
+            completed_at=record.completed_at,
+        )
+    finally:
+        db.close()
 
 
 @router.post("/review/stream")
@@ -191,3 +219,55 @@ async def stream_review(request: ReviewRequest):
             "Connection": "keep-alive",
         },
     )
+
+
+@router.post("/review/{review_id}/feedback")
+async def submit_feedback(review_id: str, feedback: ReviewFeedback):
+    """
+    Submit feedback on a completed review for model improvement.
+
+    Args:
+        review_id: UUID of the completed review
+        feedback: ReviewFeedback with helpful flag and optional comment
+
+    Returns:
+        JSON response with status and review_id
+
+    Raises:
+        404: If review ID not found
+    """
+    db = SessionLocal()
+    try:
+        record = db.query(ReviewRecord).filter(ReviewRecord.id == review_id).first()
+        if not record:
+            logger.warning(f"Feedback submission for non-existent review: {review_id}")
+            raise HTTPException(status_code=404, detail=f"Review {review_id} not found")
+
+        # Store feedback in database
+        import json
+        feedback_data = {
+            "helpful": feedback.helpful,
+            "comment": feedback.comment,
+            "submitted_at": datetime.utcnow().isoformat(),
+        }
+        record.feedback = feedback_data
+        db.commit()
+
+        # Send feedback to LangSmith for model improvement
+        try:
+            from langsmith import client as langsmith_client
+
+            langsmith_client.create_feedback(
+                run_id=review_id,
+                key="helpful" if feedback.helpful else "not_helpful",
+                score=1.0 if feedback.helpful else 0.0,
+                comment=feedback.comment,
+            )
+            logger.info(f"Feedback recorded for review {review_id}: helpful={feedback.helpful}")
+        except Exception as e:
+            logger.warning(f"Error sending feedback to LangSmith: {e}")
+            # Don't fail the request if LangSmith is unreachable
+
+        return {"status": "feedback_recorded", "review_id": review_id}
+    finally:
+        db.close()
